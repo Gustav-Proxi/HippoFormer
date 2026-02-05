@@ -1,0 +1,418 @@
+"""
+HippoFormer Training Script
+
+Training loop for HippoFormer with:
+- HuggingFace datasets integration
+- Gradient accumulation
+- Mixed precision training
+- Logging and checkpointing
+"""
+
+import os
+import math
+from typing import Optional, Dict, Any
+from dataclasses import dataclass, field
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    get_linear_schedule_with_warmup,
+)
+
+try:
+    from datasets import load_dataset
+    HAS_DATASETS = True
+except ImportError:
+    HAS_DATASETS = False
+
+from hippoformer.config import HippoFormerConfig
+from hippoformer.model import HippoFormer
+
+
+@dataclass
+class TrainingArgs:
+    """Training arguments."""
+
+    # Data
+    dataset_name: str = "wikitext"
+    dataset_config: str = "wikitext-2-raw-v1"
+    max_seq_length: int = 512
+    batch_size: int = 4
+    gradient_accumulation_steps: int = 4
+
+    # Training
+    num_epochs: int = 3
+    learning_rate: float = 1e-4
+    weight_decay: float = 0.01
+    warmup_ratio: float = 0.1
+    max_grad_norm: float = 1.0
+
+    # Mixed precision
+    use_amp: bool = True
+    amp_dtype: str = "float16"
+
+    # Logging & Checkpoints
+    output_dir: str = "./hippoformer_output"
+    logging_steps: int = 10
+    save_steps: int = 500
+    eval_steps: int = 100
+
+    # Device
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+class HippoFormerTrainer:
+    """Trainer for HippoFormer."""
+
+    def __init__(
+        self,
+        model: HippoFormer,
+        args: TrainingArgs,
+        tokenizer: Optional[Any] = None,
+    ):
+        self.model = model
+        self.args = args
+        self.tokenizer = tokenizer
+        self.device = torch.device(args.device)
+
+        # Move model to device
+        self.model.to(self.device)
+
+        # Setup optimizer
+        self.optimizer = self._create_optimizer()
+
+        # Setup AMP
+        self.scaler = torch.cuda.amp.GradScaler() if args.use_amp else None
+        self.amp_dtype = getattr(torch, args.amp_dtype) if args.use_amp else torch.float32
+
+        # Tracking
+        self.global_step = 0
+        self.epoch = 0
+
+    def _create_optimizer(self) -> torch.optim.Optimizer:
+        """Create optimizer with different learning rates for different components."""
+        # Separate parameters by component
+        base_params = []
+        hippo_params = []
+
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                if 'base_model' in name:
+                    base_params.append(param)
+                else:
+                    hippo_params.append(param)
+
+        param_groups = [
+            {"params": hippo_params, "lr": self.args.learning_rate},
+            {"params": base_params, "lr": self.args.learning_rate * 0.1},  # Lower LR for base
+        ]
+
+        return AdamW(
+            param_groups,
+            weight_decay=self.args.weight_decay,
+        )
+
+    def _create_scheduler(self, num_training_steps: int):
+        """Create learning rate scheduler."""
+        num_warmup_steps = int(num_training_steps * self.args.warmup_ratio)
+        return get_linear_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps,
+        )
+
+    def train(
+        self,
+        train_dataloader: DataLoader,
+        eval_dataloader: Optional[DataLoader] = None,
+    ) -> Dict[str, Any]:
+        """
+        Main training loop.
+
+        Args:
+            train_dataloader: DataLoader for training data
+            eval_dataloader: Optional DataLoader for evaluation
+
+        Returns:
+            Training history dictionary
+        """
+        num_training_steps = (
+            len(train_dataloader) * self.args.num_epochs //
+            self.args.gradient_accumulation_steps
+        )
+        scheduler = self._create_scheduler(num_training_steps)
+
+        # Create output directory
+        os.makedirs(self.args.output_dir, exist_ok=True)
+
+        history = {
+            "train_loss": [],
+            "eval_loss": [],
+            "salience_stats": [],
+            "memory_stats": [],
+        }
+
+        print(f"Starting training for {self.args.num_epochs} epochs")
+        print(f"Total training steps: {num_training_steps}")
+        print(f"Trainable parameters: {self.model.get_num_trainable_params():,}")
+
+        for epoch in range(self.args.num_epochs):
+            self.epoch = epoch
+            epoch_loss = self._train_epoch(
+                train_dataloader,
+                scheduler,
+                history,
+            )
+
+            print(f"Epoch {epoch + 1}/{self.args.num_epochs}, Loss: {epoch_loss:.4f}")
+
+            # Evaluation
+            if eval_dataloader is not None:
+                eval_loss = self._evaluate(eval_dataloader)
+                history["eval_loss"].append(eval_loss)
+                print(f"Eval Loss: {eval_loss:.4f}")
+
+            # Save checkpoint
+            self._save_checkpoint(epoch)
+
+        return history
+
+    def _train_epoch(
+        self,
+        dataloader: DataLoader,
+        scheduler,
+        history: Dict,
+    ) -> float:
+        """Train for one epoch."""
+        self.model.train()
+        total_loss = 0.0
+        accumulated_loss = 0.0
+
+        for step, batch in enumerate(dataloader):
+            # Move batch to device
+            input_ids = batch["input_ids"].to(self.device)
+            attention_mask = batch.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self.device)
+            labels = batch.get("labels", input_ids).to(self.device)
+
+            # Forward pass with AMP
+            with torch.cuda.amp.autocast(enabled=self.args.use_amp, dtype=self.amp_dtype):
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    return_salience=True,
+                    return_memory_stats=(step % self.args.logging_steps == 0),
+                )
+                loss = outputs["loss"] / self.args.gradient_accumulation_steps
+
+            # Backward pass
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+            accumulated_loss += loss.item()
+
+            # Gradient accumulation step
+            if (step + 1) % self.args.gradient_accumulation_steps == 0:
+                # Gradient clipping
+                if self.scaler is not None:
+                    self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.args.max_grad_norm,
+                )
+
+                # Optimizer step
+                if self.scaler is not None:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
+
+                scheduler.step()
+                self.optimizer.zero_grad()
+
+                self.global_step += 1
+                total_loss += accumulated_loss
+                history["train_loss"].append(accumulated_loss)
+
+                # Logging
+                if self.global_step % self.args.logging_steps == 0:
+                    self._log_step(
+                        step=self.global_step,
+                        loss=accumulated_loss,
+                        outputs=outputs,
+                    )
+
+                accumulated_loss = 0.0
+
+                # Save checkpoint
+                if self.global_step % self.args.save_steps == 0:
+                    self._save_checkpoint(self.epoch, is_step=True)
+
+        return total_loss / (len(dataloader) // self.args.gradient_accumulation_steps)
+
+    def _evaluate(self, dataloader: DataLoader) -> float:
+        """Evaluate model on dataloader."""
+        self.model.eval()
+        total_loss = 0.0
+
+        with torch.no_grad():
+            for batch in dataloader:
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch.get("attention_mask")
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(self.device)
+                labels = batch.get("labels", input_ids).to(self.device)
+
+                with torch.cuda.amp.autocast(enabled=self.args.use_amp, dtype=self.amp_dtype):
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                    )
+                    total_loss += outputs["loss"].item()
+
+        return total_loss / len(dataloader)
+
+    def _log_step(
+        self,
+        step: int,
+        loss: float,
+        outputs: Dict,
+    ) -> None:
+        """Log training step."""
+        log_str = f"Step {step}, Loss: {loss:.4f}"
+
+        if "salience_stats" in outputs:
+            stats = outputs["salience_stats"]
+            log_str += f", Salience: {stats['mean_salience']:.3f} (tagged: {stats['tagged_ratio']:.2%})"
+
+        if "memory_stats" in outputs:
+            stats = outputs["memory_stats"]
+            log_str += f", Buffer: {stats['buffer_utilization']:.1%}"
+
+        print(log_str)
+
+    def _save_checkpoint(self, epoch: int, is_step: bool = False) -> None:
+        """Save model checkpoint."""
+        if is_step:
+            path = os.path.join(self.args.output_dir, f"checkpoint-step-{self.global_step}")
+        else:
+            path = os.path.join(self.args.output_dir, f"checkpoint-epoch-{epoch}")
+
+        os.makedirs(path, exist_ok=True)
+
+        # Save model state
+        torch.save(
+            {
+                "model_state_dict": self.model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "epoch": epoch,
+                "global_step": self.global_step,
+            },
+            os.path.join(path, "checkpoint.pt"),
+        )
+
+        # Save config
+        torch.save(self.model.config, os.path.join(path, "config.pt"))
+
+        print(f"Saved checkpoint to {path}")
+
+
+def create_dataloaders(
+    tokenizer,
+    args: TrainingArgs,
+) -> tuple:
+    """Create train and eval dataloaders from HuggingFace datasets."""
+    if not HAS_DATASETS:
+        raise ImportError("datasets library required. Install with: pip install datasets")
+
+    # Load dataset
+    dataset = load_dataset(args.dataset_name, args.dataset_config)
+
+    def tokenize_function(examples):
+        return tokenizer(
+            examples["text"],
+            truncation=True,
+            max_length=args.max_seq_length,
+            padding="max_length",
+            return_tensors="pt",
+        )
+
+    # Tokenize
+    tokenized = dataset.map(
+        tokenize_function,
+        batched=True,
+        remove_columns=dataset["train"].column_names,
+    )
+
+    # Set format for PyTorch
+    tokenized.set_format(type="torch", columns=["input_ids", "attention_mask"])
+
+    # Create dataloaders
+    train_dataloader = DataLoader(
+        tokenized["train"],
+        batch_size=args.batch_size,
+        shuffle=True,
+    )
+
+    eval_dataloader = DataLoader(
+        tokenized["validation"] if "validation" in tokenized else tokenized["test"],
+        batch_size=args.batch_size,
+        shuffle=False,
+    )
+
+    return train_dataloader, eval_dataloader
+
+
+def main():
+    """Main training entry point."""
+    # Configuration
+    config = HippoFormerConfig(
+        base_model_name="google/gemma-2b",
+        freeze_base=True,
+        use_lora=True,
+    )
+
+    args = TrainingArgs(
+        batch_size=2,
+        gradient_accumulation_steps=8,
+        num_epochs=1,
+        learning_rate=1e-4,
+    )
+
+    print("Loading tokenizer and base model...")
+    tokenizer = AutoTokenizer.from_pretrained(config.base_model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    print("Creating HippoFormer model...")
+    model = HippoFormer(config)
+
+    print(f"Total parameters: {model.get_num_total_params():,}")
+    print(f"Trainable parameters: {model.get_num_trainable_params():,}")
+
+    print("Creating dataloaders...")
+    train_dataloader, eval_dataloader = create_dataloaders(tokenizer, args)
+
+    print("Starting training...")
+    trainer = HippoFormerTrainer(model, args, tokenizer)
+    history = trainer.train(train_dataloader, eval_dataloader)
+
+    print("Training complete!")
+    print(f"Final train loss: {history['train_loss'][-1]:.4f}")
+    if history['eval_loss']:
+        print(f"Final eval loss: {history['eval_loss'][-1]:.4f}")
+
+
+if __name__ == "__main__":
+    main()

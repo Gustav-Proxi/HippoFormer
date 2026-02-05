@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc:*)",
+      "Bash(pip install:*)",
+      "Bash(pytest:*)",
+      "Bash(python main.py:*)",
+      "WebSearch",
+      "Bash(python -m pytest:*)",
+      "Bash(system_profiler:*)",
+      "Bash(sysctl:*)",
+      "Bash(python scripts/benchmark_training.py:*)",
+      "Bash(brew upgrade:*)",
+      "Bash(aws:*)",
+      "Bash(brew install:*)",
+      "Bash(chmod:*)",
+      "Bash(curl:*)",
+      "Bash(gh auth:*)",
+      "Bash(git init:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
+    ]
+  }
+}
