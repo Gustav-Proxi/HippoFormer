@@ -258,8 +258,8 @@ HippoFormer/
 
 ## Contributors
 
-- **Vaishak Girish Kumar** (https://github.com/Gustav-Proxi) - Lead developer
-- **Sanika** - Research & development
+- **Vaishak Girish Kumar** (https://github.com/Gustav-Proxi)
+- **Sanika**
 
 ---
 
