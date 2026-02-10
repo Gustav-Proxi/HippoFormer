@@ -1,4 +1,5 @@
 <p align="center">
+  <a href="https://huggingface.co/Gustav-Proxi/HippoFormer-Gemma2B"><img src="https://img.shields.io/badge/HuggingFace-Model-yellow?logo=huggingface" alt="HuggingFace"></a>
   <img src="https://img.shields.io/badge/PyTorch-2.0+-red?logo=pytorch" alt="PyTorch">
   <img src="https://img.shields.io/badge/Transformers-4.36+-yellow?logo=huggingface" alt="Transformers">
   <img src="https://img.shields.io/badge/License-Apache_2.0-blue" alt="License">
