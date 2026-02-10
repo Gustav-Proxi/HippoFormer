@@ -1,5 +1,25 @@
+# Private planning files
 SANIKA_README.md
 SANIKA_COLLABORATION_GUIDE.md
 hf_model_card.md
 PAPER_ROADMAP.md
 VAISHAK_TODO.md
+STUDY_GUIDE.md
+
+# Private notebooks
+notebooks/SANIKA_COLAB.ipynb
+notebooks/VAISHAK_COLAB.ipynb
+
+# Internal dev files
+CLAUDE.md
+dev-notes.md
+brain.md
+evaluation method.md
+
+# Reference papers (too large for git)
+*.pdf
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
