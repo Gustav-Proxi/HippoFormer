@@ -248,11 +248,18 @@ HippoFormer/
 ```bibtex
 @misc{hippoformer2025,
   title={HippoFormer: Hippocampal Memory Selection for Transformers},
-  author={Gustav-Proxi},
+  author={Gustav-Proxi and Sanika},
   year={2025},
   howpublished={\url{https://github.com/Gustav-Proxi/HippoFormer}},
 }
 ```
+
+---
+
+## Contributors
+
+- **Gustav-Proxi** - Lead developer
+- **Sanika** - Research & development
 
 ---
 
