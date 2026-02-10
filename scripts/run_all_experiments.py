@@ -168,15 +168,76 @@ def run_baseline_comparison(checkpoint_path, output_dir, datasets, device, max_s
     except Exception as e:
         print(f"Could not load Gemma-2B: {e}")
 
-    # Try to load Longformer (if available)
+    # Try to load Mamba (state space model baseline)
     try:
-        print("\nLoading Longformer...")
-        from transformers import LongformerForMaskedLM
-        # Note: Longformer is MLM, would need different eval
-        # Skipping for now - would need proper causal LM version
-        print("Longformer skipped (MLM model, need causal variant)")
+        print("\nLoading Mamba-2.8B...")
+        from transformers import AutoModelForCausalLM as MambaLoader
+        mamba = MambaLoader.from_pretrained(
+            "state-spaces/mamba-2.8b-hf",
+            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+            trust_remote_code=True,
+        ).to(device)
+        mamba.eval()
+        baselines["Mamba-2.8B"] = mamba
+        print("Mamba-2.8B loaded successfully")
     except Exception as e:
-        print(f"Could not load Longformer: {e}")
+        print(f"Could not load Mamba: {e}")
+        print("Install with: pip install mamba-ssm")
+
+    # Try to load Transformer-XL
+    try:
+        print("\nLoading Transformer-XL...")
+        from transformers import TransfoXLLMHeadModel, TransfoXLTokenizer
+        # Note: Transformer-XL uses its own tokenizer
+        # We'll evaluate it separately with its own tokenizer
+        txl_model = TransfoXLLMHeadModel.from_pretrained("transfo-xl-wt103")
+        txl_model = txl_model.to(device)
+        txl_model.eval()
+        baselines["Transformer-XL"] = txl_model
+        print("Transformer-XL loaded successfully")
+    except Exception as e:
+        print(f"Could not load Transformer-XL: {e}")
+
+    # Try to load GPT-2 (common baseline)
+    try:
+        print("\nLoading GPT-2...")
+        gpt2 = AutoModelForCausalLM.from_pretrained(
+            "gpt2",
+            torch_dtype=torch.float32,
+        ).to(device)
+        gpt2.eval()
+        baselines["GPT-2 (124M)"] = gpt2
+        print("GPT-2 loaded successfully")
+    except Exception as e:
+        print(f"Could not load GPT-2: {e}")
+
+    # Try to load GPT-2 Medium
+    try:
+        print("\nLoading GPT-2 Medium...")
+        gpt2_med = AutoModelForCausalLM.from_pretrained(
+            "gpt2-medium",
+            torch_dtype=torch.float32,
+        ).to(device)
+        gpt2_med.eval()
+        baselines["GPT-2 Medium (355M)"] = gpt2_med
+        print("GPT-2 Medium loaded successfully")
+    except Exception as e:
+        print(f"Could not load GPT-2 Medium: {e}")
+
+    # Try to load Pythia (EleutherAI)
+    try:
+        print("\nLoading Pythia-2.8B...")
+        pythia = AutoModelForCausalLM.from_pretrained(
+            "EleutherAI/pythia-2.8b",
+            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        ).to(device)
+        pythia.eval()
+        baselines["Pythia-2.8B"] = pythia
+        print("Pythia-2.8B loaded successfully")
+    except Exception as e:
+        print(f"Could not load Pythia: {e}")
+
+    print(f"\n{len(baselines)} models loaded for comparison")
 
     # 3. Evaluate on each dataset
     for dataset in datasets:
