@@ -31,43 +31,8 @@
 - **Maintain stable representations** through drift calibration
 
 <p align="center">
-  <img src="docs/architecture.png" alt="HippoFormer Architecture" width="700">
+  <img src="docs/figures/architecture.png" alt="HippoFormer Architecture" width="800">
 </p>
-
-```
-Input Tokens
-     │
-     ▼
-┌─────────────────────────────────────────────────────────────┐
-│           Base Transformer (Gemma-2B, frozen + LoRA)        │
-└─────────────────────────────────────────────────────────────┘
-     │
-     ▼
-┌─────────────────────────────────────────────────────────────┐
-│  SALIENCE GATE                                              │
-│  Dual-pathway importance scoring inspired by SPW-Rs         │
-│  • Local: token-intrinsic importance (single neuron)        │
-│  • Global: contextual importance (population synchrony)     │
-└─────────────────────────────────────────────────────────────┘
-     │
-     ▼
-┌─────────────────────────────────────────────────────────────┐
-│  MEMORY CONSOLIDATOR                                        │
-│  Priority buffer with multi-round replay                    │
-│  • Exponential decay mimics memory consolidation            │
-│  • High-importance tokens persist longer                    │
-└─────────────────────────────────────────────────────────────┘
-     │
-     ▼
-┌─────────────────────────────────────────────────────────────┐
-│  OUTPUT FUSION                                              │
-│  Cross-attention integration of consolidated memories       │
-│  • Gated fusion: output = g·memory + (1-g)·hidden          │
-└─────────────────────────────────────────────────────────────┘
-     │
-     ▼
-Output Logits
-```
 
 ---
 
