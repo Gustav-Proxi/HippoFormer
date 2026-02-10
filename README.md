@@ -248,7 +248,7 @@ HippoFormer/
 ```bibtex
 @misc{hippoformer2025,
   title={HippoFormer: Hippocampal Memory Selection for Transformers},
-  author={Gustav-Proxi and Sanika},
+  author={Vaishak Girish Kumar and Sanika},
   year={2025},
   howpublished={\url{https://github.com/Gustav-Proxi/HippoFormer}},
 }
@@ -258,7 +258,7 @@ HippoFormer/
 
 ## Contributors
 
-- **Gustav-Proxi** - Lead developer
+- **Vaishak Girish Kumar** ([@Gustav-Proxi](https://github.com/Gustav-Proxi)) - Lead developer
 - **Sanika** - Research & development
 
 ---
