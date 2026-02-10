@@ -30,6 +30,12 @@ try:
 except ImportError:
     HAS_DATASETS = False
 
+try:
+    import wandb
+    HAS_WANDB = True
+except ImportError:
+    HAS_WANDB = False
+
 from hippoformer.config import HippoFormerConfig
 from hippoformer.model import HippoFormer
 
@@ -65,6 +71,14 @@ class TrainingArgs:
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # Weights & Biases
+    use_wandb: bool = True
+    wandb_project: str = "hippoformer"
+    wandb_run_name: Optional[str] = None
+
+    # Resume from checkpoint
+    resume_from_checkpoint: Optional[str] = None
+
 
 class HippoFormerTrainer:
     """Trainer for HippoFormer."""
@@ -93,6 +107,48 @@ class HippoFormerTrainer:
         # Tracking
         self.global_step = 0
         self.epoch = 0
+
+        # Initialize W&B
+        self.use_wandb = args.use_wandb and HAS_WANDB
+        if self.use_wandb:
+            wandb.init(
+                project=args.wandb_project,
+                name=args.wandb_run_name,
+                config={
+                    "learning_rate": args.learning_rate,
+                    "batch_size": args.batch_size,
+                    "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                    "num_epochs": args.num_epochs,
+                    "max_seq_length": args.max_seq_length,
+                    "weight_decay": args.weight_decay,
+                    "warmup_ratio": args.warmup_ratio,
+                    "use_amp": args.use_amp,
+                    "total_params": model.get_num_total_params(),
+                    "trainable_params": model.get_num_trainable_params(),
+                },
+            )
+            wandb.watch(model, log="gradients", log_freq=100)
+
+        # Resume from checkpoint if specified
+        if args.resume_from_checkpoint:
+            self._load_checkpoint(args.resume_from_checkpoint)
+
+    def _load_checkpoint(self, checkpoint_path: str) -> None:
+        """Load model from checkpoint."""
+        ckpt_file = os.path.join(checkpoint_path, "checkpoint.pt")
+        if not os.path.exists(ckpt_file):
+            print(f"Warning: Checkpoint not found at {ckpt_file}, starting fresh")
+            return
+
+        print(f"Loading checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(ckpt_file, map_location=self.device)
+
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.epoch = checkpoint.get("epoch", 0)
+        self.global_step = checkpoint.get("global_step", 0)
+
+        print(f"Resumed from epoch {self.epoch}, step {self.global_step}")
 
     def _create_optimizer(self) -> torch.optim.Optimizer:
         """Create optimizer with different learning rates for different components."""
@@ -147,6 +203,16 @@ class HippoFormerTrainer:
         )
         scheduler = self._create_scheduler(num_training_steps)
 
+        # Fast-forward scheduler if resuming
+        starting_step = self.global_step
+        if starting_step > 0:
+            print(f"Resuming from step {starting_step}, fast-forwarding scheduler...")
+            for _ in range(starting_step):
+                scheduler.step()
+
+        # Store starting step for _train_epoch to use
+        self._starting_step = starting_step
+
         # Create output directory
         os.makedirs(self.args.output_dir, exist_ok=True)
 
@@ -176,9 +242,15 @@ class HippoFormerTrainer:
                 eval_loss = self._evaluate(eval_dataloader)
                 history["eval_loss"].append(eval_loss)
                 print(f"Eval Loss: {eval_loss:.4f}")
+                if self.use_wandb:
+                    wandb.log({"eval/loss": eval_loss, "eval/epoch": epoch + 1})
 
             # Save checkpoint
             self._save_checkpoint(epoch)
+
+        # Finish W&B run
+        if self.use_wandb:
+            wandb.finish()
 
         return history
 
@@ -193,7 +265,18 @@ class HippoFormerTrainer:
         total_loss = 0.0
         accumulated_loss = 0.0
 
+        # Calculate step to resume from (only applies once at start)
+        resume_step = getattr(self, '_starting_step', 0) * self.args.gradient_accumulation_steps
+
         for step, batch in enumerate(dataloader):
+            # Skip steps already processed (for resuming)
+            if step < resume_step:
+                if step % 5000 == 0:
+                    print(f"Skipping to step {step}/{resume_step}...")
+                continue
+            elif step == resume_step and resume_step > 0:
+                print(f"Resuming training from batch {step}")
+                self._starting_step = 0  # Clear so subsequent epochs don't skip
             # Move batch to device
             input_ids = batch["input_ids"].to(self.device)
             attention_mask = batch.get("attention_mask")
@@ -246,10 +329,12 @@ class HippoFormerTrainer:
 
                 # Logging
                 if self.global_step % self.args.logging_steps == 0:
+                    current_lr = scheduler.get_last_lr()[0]
                     self._log_step(
                         step=self.global_step,
                         loss=accumulated_loss,
                         outputs=outputs,
+                        lr=current_lr,
                     )
 
                 accumulated_loss = 0.0
@@ -288,19 +373,30 @@ class HippoFormerTrainer:
         step: int,
         loss: float,
         outputs: Dict,
+        lr: Optional[float] = None,
     ) -> None:
         """Log training step."""
         log_str = f"Step {step}, Loss: {loss:.4f}"
+        wandb_log = {"train/loss": loss, "train/step": step}
+
+        if lr is not None:
+            wandb_log["train/learning_rate"] = lr
 
         if "salience_stats" in outputs:
             stats = outputs["salience_stats"]
             log_str += f", Salience: {stats['mean_salience']:.3f} (tagged: {stats['tagged_ratio']:.2%})"
+            wandb_log["salience/mean"] = stats["mean_salience"]
+            wandb_log["salience/tagged_ratio"] = stats["tagged_ratio"]
 
         if "memory_stats" in outputs:
             stats = outputs["memory_stats"]
             log_str += f", Buffer: {stats['buffer_utilization']:.1%}"
+            wandb_log["memory/buffer_utilization"] = stats["buffer_utilization"]
 
         print(log_str)
+
+        if self.use_wandb:
+            wandb.log(wandb_log, step=step)
 
     def _save_checkpoint(self, epoch: int, is_step: bool = False) -> None:
         """Save model checkpoint."""
@@ -384,10 +480,19 @@ def main():
     )
 
     args = TrainingArgs(
-        batch_size=2,
-        gradient_accumulation_steps=8,
+        dataset_name="wikitext",
+        dataset_config="wikitext-103-raw-v1",  # Larger dataset (100M tokens)
+        batch_size=2,  # Reduced for memory stability
+        gradient_accumulation_steps=8,  # Maintain effective batch of 16
+        max_seq_length=256,  # Reduced for memory
         num_epochs=1,
-        learning_rate=1e-4,
+        learning_rate=1e-5,  # Very conservative to prevent explosion
+        warmup_ratio=0.1,  # Longer warmup
+        max_grad_norm=0.5,  # Aggressive gradient clipping
+        use_amp=True,
+        amp_dtype="bfloat16",
+        wandb_run_name="hippoformer-gemma2b-wikitext103-v10",
+        save_steps=5000,  # Save less frequently
     )
 
     print("Loading tokenizer and base model...")
@@ -397,6 +502,7 @@ def main():
 
     print("Creating HippoFormer model...")
     model = HippoFormer(config)
+
 
     print(f"Total parameters: {model.get_num_total_params():,}")
     print(f"Trainable parameters: {model.get_num_trainable_params():,}")
