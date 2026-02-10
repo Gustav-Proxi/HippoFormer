@@ -259,7 +259,7 @@ HippoFormer/
 ## Contributors
 
 - **Vaishak Girish Kumar** (https://github.com/Gustav-Proxi)
-- **Sanika**
+- **Sanika** (https://github.com/Sanika0212)
 
 ---
 
