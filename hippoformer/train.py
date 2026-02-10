@@ -432,68 +432,229 @@ def create_dataloaders(
     if not HAS_DATASETS:
         raise ImportError("datasets library required. Install with: pip install datasets")
 
-    # Load dataset
-    dataset = load_dataset(args.dataset_name, args.dataset_config)
+    # Dataset-specific loading
+    DATASET_CONFIGS = {
+        "wikitext": {
+            "text_field": "text",
+            "streaming": False,
+        },
+        "togethercomputer/RedPajama-Data-1T-Sample": {
+            "text_field": "text",
+            "streaming": True,  # Large dataset, use streaming
+        },
+        "openwebtext": {
+            "text_field": "text",
+            "streaming": True,
+        },
+        "EleutherAI/pile": {
+            "text_field": "text",
+            "streaming": True,
+        },
+    }
 
-    def tokenize_function(examples):
-        return tokenizer(
-            examples["text"],
-            truncation=True,
-            max_length=args.max_seq_length,
-            padding="max_length",
-            return_tensors="pt",
+    dataset_info = DATASET_CONFIGS.get(args.dataset_name, {"text_field": "text", "streaming": False})
+    text_field = dataset_info["text_field"]
+    use_streaming = dataset_info.get("streaming", False)
+
+    print(f"Loading dataset: {args.dataset_name}")
+    print(f"Config: {args.dataset_config}")
+    print(f"Streaming: {use_streaming}")
+
+    if use_streaming:
+        # Streaming mode for large datasets
+        dataset = load_dataset(
+            args.dataset_name,
+            args.dataset_config if args.dataset_config else None,
+            split="train",
+            streaming=True,
         )
 
-    # Tokenize
-    tokenized = dataset.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=dataset["train"].column_names,
-    )
+        def tokenize_function(examples):
+            texts = examples[text_field] if isinstance(examples[text_field], list) else [examples[text_field]]
+            texts = [t for t in texts if t and len(t.strip()) > 0]
+            if not texts:
+                return {"input_ids": [], "attention_mask": []}
+            return tokenizer(
+                texts,
+                truncation=True,
+                max_length=args.max_seq_length,
+                padding="max_length",
+            )
 
-    # Set format for PyTorch
-    tokenized.set_format(type="torch", columns=["input_ids", "attention_mask"])
+        tokenized = dataset.map(tokenize_function, batched=True, remove_columns=[text_field])
 
-    # Create dataloaders
-    train_dataloader = DataLoader(
-        tokenized["train"],
-        batch_size=args.batch_size,
-        shuffle=True,
-    )
+        # For streaming, we use IterableDataset
+        from torch.utils.data import IterableDataset
 
-    eval_dataloader = DataLoader(
-        tokenized["validation"] if "validation" in tokenized else tokenized["test"],
-        batch_size=args.batch_size,
-        shuffle=False,
-    )
+        class StreamingDataset(IterableDataset):
+            def __init__(self, dataset, max_samples=None):
+                self.dataset = dataset
+                self.max_samples = max_samples
+
+            def __iter__(self):
+                count = 0
+                for item in self.dataset:
+                    if self.max_samples and count >= self.max_samples:
+                        break
+                    if "input_ids" in item and len(item["input_ids"]) > 0:
+                        yield {
+                            "input_ids": torch.tensor(item["input_ids"]),
+                            "attention_mask": torch.tensor(item["attention_mask"]),
+                        }
+                        count += 1
+
+        train_dataset = StreamingDataset(tokenized, max_samples=getattr(args, 'max_samples', None))
+        train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size)
+
+        # For eval, use WikiText-2 validation (standard benchmark)
+        print("Loading WikiText-2 validation for evaluation...")
+        eval_dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="validation")
+        eval_dataset = eval_dataset.filter(lambda x: len(x["text"].strip()) > 0)
+
+        def eval_tokenize(examples):
+            return tokenizer(
+                examples["text"],
+                truncation=True,
+                max_length=args.max_seq_length,
+                padding="max_length",
+            )
+
+        eval_tokenized = eval_dataset.map(eval_tokenize, batched=True, remove_columns=["text"])
+        eval_tokenized.set_format(type="torch", columns=["input_ids", "attention_mask"])
+        eval_dataloader = DataLoader(eval_tokenized, batch_size=args.batch_size, shuffle=False)
+
+    else:
+        # Standard mode for smaller datasets
+        dataset = load_dataset(args.dataset_name, args.dataset_config)
+
+        def tokenize_function(examples):
+            return tokenizer(
+                examples[text_field],
+                truncation=True,
+                max_length=args.max_seq_length,
+                padding="max_length",
+            )
+
+        # Tokenize
+        tokenized = dataset.map(
+            tokenize_function,
+            batched=True,
+            remove_columns=dataset["train"].column_names,
+        )
+
+        # Set format for PyTorch
+        tokenized.set_format(type="torch", columns=["input_ids", "attention_mask"])
+
+        # Create dataloaders
+        train_dataloader = DataLoader(
+            tokenized["train"],
+            batch_size=args.batch_size,
+            shuffle=True,
+        )
+
+        eval_dataloader = DataLoader(
+            tokenized["validation"] if "validation" in tokenized else tokenized["test"],
+            batch_size=args.batch_size,
+            shuffle=False,
+        )
 
     return train_dataloader, eval_dataloader
 
 
 def main():
-    """Main training entry point."""
-    # Configuration
+    """Main training entry point with CLI support."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Train HippoFormer")
+
+    # Model arguments
+    parser.add_argument("--base_model", type=str, default="google/gemma-2b",
+                        help="Base model (google/gemma-2b, meta-llama/Llama-2-7b-hf, mistralai/Mistral-7B-v0.1)")
+    parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank")
+    parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha")
+
+    # Dataset arguments
+    parser.add_argument("--dataset", type=str, default="wikitext",
+                        choices=["wikitext", "togethercomputer/RedPajama-Data-1T-Sample", "openwebtext"],
+                        help="Dataset to use")
+    parser.add_argument("--dataset_config", type=str, default="wikitext-2-raw-v1",
+                        help="Dataset config (e.g., wikitext-2-raw-v1, wikitext-103-raw-v1)")
+    parser.add_argument("--max_samples", type=int, default=None,
+                        help="Max samples for streaming datasets")
+
+    # Training arguments
+    parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=8,
+                        help="Gradient accumulation steps")
+    parser.add_argument("--max_seq_length", type=int, default=512, help="Max sequence length")
+    parser.add_argument("--num_epochs", type=int, default=1, help="Number of epochs")
+    parser.add_argument("--max_steps", type=int, default=None, help="Max training steps (overrides epochs)")
+    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate")
+    parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Warmup ratio")
+
+    # Output arguments
+    parser.add_argument("--output_dir", type=str, default="./hippoformer_output",
+                        help="Output directory")
+    parser.add_argument("--save_steps", type=int, default=5000, help="Save checkpoint every N steps")
+    parser.add_argument("--logging_steps", type=int, default=10, help="Log every N steps")
+
+    # W&B arguments
+    parser.add_argument("--wandb_project", type=str, default="hippoformer", help="W&B project")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="W&B run name")
+    parser.add_argument("--no_wandb", action="store_true", help="Disable W&B")
+
+    # Resume
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                        help="Resume from checkpoint path")
+
+    cli_args = parser.parse_args()
+
+    # Print configuration
+    print("=" * 60)
+    print("HippoFormer Training Configuration")
+    print("=" * 60)
+    print(f"Base model:     {cli_args.base_model}")
+    print(f"Dataset:        {cli_args.dataset} ({cli_args.dataset_config})")
+    print(f"Batch size:     {cli_args.batch_size} x {cli_args.gradient_accumulation_steps} = {cli_args.batch_size * cli_args.gradient_accumulation_steps}")
+    print(f"Sequence length: {cli_args.max_seq_length}")
+    print(f"Learning rate:  {cli_args.learning_rate}")
+    print(f"Output:         {cli_args.output_dir}")
+    print("=" * 60)
+
+    # Model configuration
     config = HippoFormerConfig(
-        base_model_name="google/gemma-2b",
+        base_model_name=cli_args.base_model,
         freeze_base=True,
         use_lora=True,
+        lora_r=cli_args.lora_r,
+        lora_alpha=cli_args.lora_alpha,
     )
 
+    # Training arguments
     args = TrainingArgs(
-        dataset_name="wikitext",
-        dataset_config="wikitext-103-raw-v1",  # Larger dataset (100M tokens)
-        batch_size=2,  # Reduced for memory stability
-        gradient_accumulation_steps=8,  # Maintain effective batch of 16
-        max_seq_length=256,  # Reduced for memory
-        num_epochs=1,
-        learning_rate=1e-5,  # Very conservative to prevent explosion
-        warmup_ratio=0.1,  # Longer warmup
-        max_grad_norm=0.5,  # Aggressive gradient clipping
+        dataset_name=cli_args.dataset,
+        dataset_config=cli_args.dataset_config if cli_args.dataset == "wikitext" else None,
+        batch_size=cli_args.batch_size,
+        gradient_accumulation_steps=cli_args.gradient_accumulation_steps,
+        max_seq_length=cli_args.max_seq_length,
+        num_epochs=cli_args.num_epochs,
+        learning_rate=cli_args.learning_rate,
+        warmup_ratio=cli_args.warmup_ratio,
+        max_grad_norm=0.5,
         use_amp=True,
         amp_dtype="bfloat16",
-        wandb_run_name="hippoformer-gemma2b-wikitext103-v10",
-        save_steps=5000,  # Save less frequently
+        output_dir=cli_args.output_dir,
+        save_steps=cli_args.save_steps,
+        logging_steps=cli_args.logging_steps,
+        use_wandb=not cli_args.no_wandb,
+        wandb_project=cli_args.wandb_project,
+        wandb_run_name=cli_args.wandb_run_name or f"hippoformer-{cli_args.base_model.split('/')[-1]}-{cli_args.dataset.split('/')[-1]}",
+        resume_from_checkpoint=cli_args.resume_from_checkpoint,
     )
+
+    # Add max_samples to args if provided
+    if cli_args.max_samples:
+        args.max_samples = cli_args.max_samples
 
     print("Loading tokenizer and base model...")
     tokenizer = AutoTokenizer.from_pretrained(config.base_model_name)
@@ -502,7 +663,6 @@ def main():
 
     print("Creating HippoFormer model...")
     model = HippoFormer(config)
-
 
     print(f"Total parameters: {model.get_num_total_params():,}")
     print(f"Trainable parameters: {model.get_num_trainable_params():,}")
