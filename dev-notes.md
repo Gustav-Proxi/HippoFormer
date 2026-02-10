@@ -281,10 +281,90 @@ source ~/activate.sh
 - Spot instances: 60-70% savings
 
 ### Pending / next steps
-- [ ] Authenticate with HuggingFace (`huggingface-cli login`) for Gemma access
-- [ ] Add `--max-samples` flag to train.py for quick iteration
-- [ ] Run initial WikiText-2 training (quick test with 1K samples)
-- [ ] Execute ablation study
+- [x] Authenticate with HuggingFace (`huggingface-cli login`) for Gemma access
+- [x] Add `--max-samples` flag to train.py for quick iteration
+- [x] Run initial WikiText-2 training (quick test with 1K samples)
+- [x] Execute ablation study
 - [ ] Scale to PG-19/NarrativeQA (cloud GPU)
 - [ ] Generate paper figures
 - [ ] Write up results
+
+---
+
+## 2026-02-09
+
+### Full Training Complete on RunPod
+
+Trained HippoFormer on WikiText-2 using RunPod cloud GPU (RTX 4090).
+
+**Training Details:**
+- GPU: NVIDIA RTX 4090 (24GB VRAM)
+- Dataset: WikiText-2
+- Base model: Gemma-2B with LoRA
+- Total steps: 112,584 (1 epoch)
+- Training time: ~24 hours
+- Cost: ~$14 ($0.59/hr)
+
+**Best Checkpoint:** `checkpoint-step-110000`
+- Final checkpoint (step 112584) showed degradation - use step 110k
+
+### Results
+
+**Perplexity:**
+| Model | WikiText-2 PPL |
+|-------|----------------|
+| GPT-2 (124M) | ~29 |
+| Gemma-2B (base) | ~18 |
+| **HippoFormer** | **11.83** |
+
+**Ablation Study:**
+| Variant | PPL | Impact |
+|---------|-----|--------|
+| Full Model | 11.83 | baseline |
+| No Salience | 39.75 | +27.92 worse |
+| No Memory | 89.84 | +78.01 worse |
+| Random Salience | 89.84 | +78.01 worse |
+
+**Key Finding:** Both salience gate AND memory buffer are critical.
+
+### Comprehensive Evaluation
+
+Added `evaluation/comprehensive_eval.py` - tests all brain-inspired components:
+
+**Brain-Like Behavior Validated:**
+| Test | Result |
+|------|--------|
+| Selective tagging | 2.11x (content vs function words) |
+| Long-range benefit | +6.95 PPL improvement on late tokens |
+| Buffer utilization | 100%, mean priority 4.9/5.0 |
+| Temporal coherence | 0.58 |
+
+**Salience Gate Analysis:**
+- Content words tagged 2x more than function words
+- Mean salience: 0.58, Tagged ratio: 57.9%
+- Validates hippocampal-like selective memory
+
+**Memory Buffer:**
+- 73.7M total writes
+- High-priority items retained (4.9/5.0 mean priority)
+- Removing memory increases PPL by 78 points
+
+### Model Published
+
+**HuggingFace:** https://huggingface.co/Gustav-Proxi/HippoFormer-Gemma2B
+
+**GitHub:** https://github.com/Gustav-Proxi/HippoFormer
+
+### Training Script Updates
+
+Updated `hippoformer/train.py`:
+- Added Weights & Biases integration
+- Added checkpoint resumption support
+- Improved logging
+
+### Pending / next steps
+- [ ] Scale to PG-19/NarrativeQA (long-context evaluation)
+- [ ] Generate paper figures with visualization.py
+- [ ] Write up results for paper
+- [ ] Investigate why final checkpoint degraded (training instability at end?)
+- [ ] Try training for more epochs
